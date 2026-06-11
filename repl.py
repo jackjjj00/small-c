@@ -1,11 +1,29 @@
 # repl.py
 import sys
+import os
 import re
 import lexer
 from parser import Parser
 from interpreter import Interpreter
 
 EXPR_NODE_TYPES = ('BinOpNode', 'UnaryOpNode', 'NumberNode', 'HexNode')
+
+HELP_TEXT = """
+Available commands:
+  HELP                  顯示此說明
+  NEW                   清除緩衝區、記憶體、符號表與巨集表
+  CLEAR                 同 NEW
+  APPEND                進入附加模式，輸入 '.' 結束
+  LIST                  列出緩衝區所有程式行
+  EDIT <n> <code>       修改緩衝區第 n 行
+  DELETE <n>            刪除緩衝區第 n 行
+  RUN                   執行緩衝區內所有程式
+  SAVE <filename>       將緩衝區存入檔案
+  LOAD <filename>       從檔案載入程式到緩衝區
+  FUNCTION              列出目前已定義的函式
+  TRACE ON|OFF          開啟或關閉 Debug 追蹤模式
+  QUIT / EXIT           離開直譯器
+"""
 
 
 class REPL:
@@ -101,10 +119,9 @@ class REPL:
             if result is not None and type(ast_root).__name__ in EXPR_NODE_TYPES:
                 print(result)
 
-        # 若這段程式碼定義了 main，且 main 尚未被呼叫，自動呼叫
+        # 若這段程式碼定義了 main，自動呼叫後移除，避免下次重複執行
         if 'main' in self.symtable.functions:
             interp._call_user_func('main', [])
-            # 呼叫完後從函式表移除，避免下次又重複呼叫
             del self.symtable.functions['main']
 
     # ============================================================
@@ -121,11 +138,13 @@ class REPL:
                 prompt = ("  " * self._brace_depth + ".. ") if self._brace_depth > 0 else "sc> "
                 line = input(prompt)
 
+                # ── 空行處理 ─────────────────────────────────────
                 if not line.strip():
                     if self._brace_depth > 0:
                         self._pending_lines.append(line)
                     continue
 
+                # ── 累積模式中不解析指令 ──────────────────────────
                 if self._brace_depth == 0:
                     if self._handle_define(line):
                         continue
@@ -133,11 +152,18 @@ class REPL:
                     cmd_parts = line.split()
                     main_cmd = cmd_parts[0].upper()
 
+                    # ── QUIT / EXIT ───────────────────────────────
                     if main_cmd in ("QUIT", "EXIT"):
                         print("Goodbye.")
                         break
 
-                    elif main_cmd == "NEW":
+                    # ── HELP ─────────────────────────────────────
+                    elif main_cmd == "HELP":
+                        print(HELP_TEXT)
+                        continue
+
+                    # ── NEW / CLEAR ───────────────────────────────
+                    elif main_cmd in ("NEW", "CLEAR"):
                         self.buffer = [""]
                         self.memory.reset()
                         self.symtable.reset()
@@ -147,6 +173,7 @@ class REPL:
                         print("All cleared.")
                         continue
 
+                    # ── APPEND ────────────────────────────────────
                     elif main_cmd == "APPEND":
                         print("Entering append mode. Type '.' on a blank line to exit.")
                         current_line_num = len(self.buffer)
@@ -158,6 +185,7 @@ class REPL:
                             current_line_num += 1
                         continue
 
+                    # ── LIST ──────────────────────────────────────
                     elif main_cmd == "LIST":
                         if len(self.buffer) <= 1:
                             print("Buffer is empty.")
@@ -166,6 +194,40 @@ class REPL:
                                 print(f"  {idx}: {self.buffer[idx]}")
                         continue
 
+                    # ── EDIT <n> <code> ───────────────────────────
+                    elif main_cmd == "EDIT":
+                        if len(cmd_parts) < 3:
+                            print("Usage: EDIT <line_number> <new_code>")
+                        else:
+                            try:
+                                n = int(cmd_parts[1])
+                                new_code = " ".join(cmd_parts[2:])
+                                if 1 <= n < len(self.buffer):
+                                    self.buffer[n] = new_code
+                                    print(f"Line {n} updated.")
+                                else:
+                                    print(f"Error: Line {n} does not exist.")
+                            except ValueError:
+                                print("Error: Line number must be an integer.")
+                        continue
+
+                    # ── DELETE <n> ────────────────────────────────
+                    elif main_cmd == "DELETE":
+                        if len(cmd_parts) < 2:
+                            print("Usage: DELETE <line_number>")
+                        else:
+                            try:
+                                n = int(cmd_parts[1])
+                                if 1 <= n < len(self.buffer):
+                                    removed = self.buffer.pop(n)
+                                    print(f"Line {n} deleted: {removed}")
+                                else:
+                                    print(f"Error: Line {n} does not exist.")
+                            except ValueError:
+                                print("Error: Line number must be an integer.")
+                        continue
+
+                    # ── RUN ───────────────────────────────────────
                     elif main_cmd == "RUN":
                         if len(self.buffer) <= 1:
                             print("Buffer is empty.")
@@ -177,6 +239,56 @@ class REPL:
                                 print(e)
                         continue
 
+                    # ── SAVE <filename> ───────────────────────────
+                    elif main_cmd == "SAVE":
+                        if len(cmd_parts) < 2:
+                            print("Usage: SAVE <filename>")
+                        else:
+                            filename = cmd_parts[1]
+                            if len(self.buffer) <= 1:
+                                print("Buffer is empty, nothing to save.")
+                            else:
+                                try:
+                                    with open(filename, 'w', encoding='utf-8') as f:
+                                        f.write("\n".join(self.buffer[1:]))
+                                    print(f"Saved to '{filename}' ({len(self.buffer)-1} lines).")
+                                except Exception as e:
+                                    print(f"Error saving file: {e}")
+                        continue
+
+                    # ── LOAD <filename> ───────────────────────────
+                    elif main_cmd == "LOAD":
+                        if len(cmd_parts) < 2:
+                            print("Usage: LOAD <filename>")
+                        else:
+                            filename = cmd_parts[1]
+                            if not os.path.exists(filename):
+                                print(f"Error: File '{filename}' not found.")
+                            else:
+                                try:
+                                    with open(filename, 'r', encoding='utf-8') as f:
+                                        lines = f.read().splitlines()
+                                    self.buffer = [""] + lines
+                                    print(f"Loaded '{filename}' ({len(lines)} lines). Use RUN to execute.")
+                                except Exception as e:
+                                    print(f"Error loading file: {e}")
+                        continue
+
+                    # ── FUNCTION ──────────────────────────────────
+                    elif main_cmd == "FUNCTION":
+                        if not self.symtable.functions:
+                            print("No user-defined functions.")
+                        else:
+                            print("Defined functions:")
+                            for fname, fnode in self.symtable.functions.items():
+                                params = ", ".join(
+                                    f"{p[0]}{'*' if p[2] else ''} {p[1]}"
+                                    for p in fnode.params
+                                )
+                                print(f"  {fnode.return_type} {fname}({params})")
+                        continue
+
+                    # ── TRACE ON / OFF ────────────────────────────
                     elif main_cmd == "TRACE":
                         if len(cmd_parts) > 1 and cmd_parts[1].upper() == "ON":
                             self.trace_mode = True
@@ -184,8 +296,11 @@ class REPL:
                         elif len(cmd_parts) > 1 and cmd_parts[1].upper() == "OFF":
                             self.trace_mode = False
                             print("Trace mode disabled.")
+                        else:
+                            print("Usage: TRACE ON | TRACE OFF")
                         continue
 
+                # ── 大括號計數，決定是否累積 ──────────────────────
                 delta = self._count_braces(line)
 
                 if self._brace_depth > 0 or delta > 0:
